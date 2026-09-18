@@ -70,11 +70,13 @@ def main(argv: list[str] | None = None):
     cut_p = subparsers.add_parser(
         "cut", help="Cut the first N frames / M seconds from specific episodes (videos included)")
     cut_p.add_argument("dataset", help="Path to local dataset (v2.x)")
-    cut_p.add_argument("--cut", action="append", default=[], metavar="EP:START", dest="cuts",
-                       help="Episode and cut point: '42:120' (frames) or '42:3.5s' (seconds). "
-                            "Repeatable. Cut points are relative to the current dataset state.")
+    cut_p.add_argument("--cut", action="append", default=[], metavar="EP:START[:END]", dest="cuts",
+                       help="Keep frames [START, END) of an episode; points are frames ('120') "
+                            "or seconds ('3.5s'). '42:120' drops the first 120 frames; "
+                            "'42::15.2s' drops everything from 15.2s onward; '42:120:450' keeps "
+                            "the middle. Repeatable; relative to the current dataset state.")
     cut_p.add_argument("--cuts-file", metavar="FILE",
-                       help="File with one EP:START spec per line ('#' comments allowed)")
+                       help="File with one EP:START[:END] spec per line ('#' comments allowed)")
     cut_p.add_argument("--force", action="store_true",
                        help="Allow cuts that leave an episode shorter than 2 seconds")
     cut_p.add_argument("--dry-run", action="store_true")

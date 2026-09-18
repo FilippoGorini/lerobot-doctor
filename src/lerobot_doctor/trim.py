@@ -73,9 +73,10 @@ def trim_dataset(
         video_cpu_used: libaom-av1 speed/quality knob for the fallback
             (0 = slowest/best, default 3).
         manual_cuts: Manual mode (used by ``cut_dataset``): {episode_index:
-            n_leading_frames_to_drop}. Episodes not listed pass through
-            untouched; activity detection, static removal and gripper pre-roll
-            are all skipped.
+            (start, end)} — keep frames [start, end), end=None meaning the
+            episode's end. Episodes not listed pass through untouched;
+            activity detection, static removal and gripper pre-roll are all
+            skipped.
         min_remaining_frames: Manual mode only — refuse a cut that would leave
             an episode shorter than this.
         dry_run: Only report, don't modify
@@ -146,16 +147,17 @@ def trim_dataset(
 
                 if manual_cuts is not None:
                     # Manual cut mode: only listed episodes are touched, and
-                    # the cut point is taken as-is (no activity detection, no
+                    # the cut range is taken as-is (no activity detection, no
                     # static removal, no gripper pre-roll).
                     if ep_idx not in manual_cuts:
                         rows_to_keep.extend(row_indices)
                         continue
-                    start, end = manual_cuts[ep_idx], len(row_indices)
+                    start, end_req = manual_cuts[ep_idx]
+                    end = len(row_indices) if end_req is None else min(end_req, len(row_indices))
                     if end - start < max(min_remaining_frames, 1):
                         raise ValueError(
                             f"cut: episode {ep_idx} has {len(row_indices)} frames; "
-                            f"cutting {start} leaves {end - start} "
+                            f"keeping [{start}:{end}) leaves {max(end - start, 0)} "
                             f"(minimum {max(min_remaining_frames, 1)})"
                         )
                 else:
@@ -270,10 +272,15 @@ def trim_dataset(
                 if n_removed > 0:
                     result.episodes_trimmed += 1
                     result.frames_removed += n_removed
-                    verb = ("cut first" if manual_cuts is not None else "trimmed")
-                    kind = "" if manual_cuts is not None else " idle"
+                    if manual_cuts is not None:
+                        n_head, n_tail = start, len(row_indices) - end
+                        parts = ([f"first {n_head}"] if n_head else []) + \
+                                ([f"last {n_tail}"] if n_tail else [])
+                        what = f"cut {' + '.join(parts)} frames"
+                    else:
+                        what = f"trimmed {n_removed} idle frames"
                     result.details.append(
-                        f"Episode {ep_idx}: {verb} {n_removed}{kind} frames "
+                        f"Episode {ep_idx}: {what} "
                         f"({len(row_indices)} → {len(trimmed_indices)}){video_note}"
                     )
                 elif pending_cuts and pending_cuts[-1][0] == ep_idx:
@@ -331,14 +338,21 @@ def cut_dataset(
     video_crf: int = 14,
     video_cpu_used: int = 3,
 ) -> TrimResult:
-    """Manually cut the first frames/seconds off specific episodes.
+    """Manually cut frames off the start and/or end of specific episodes.
 
-    ``cuts`` maps episode_index -> cut spec: a frame count ("120") or seconds
-    with an "s" suffix ("3.5s", resolved via the dataset fps). Cut points are
-    relative to the dataset's *current* state (what you see when playing it
-    back). Videos are always cut too — lossless keyframe-aligned stream copy
-    when possible (the start may move up to ``video_copy_slack`` frames
-    earlier), AV1 re-encode otherwise — and timestamps are rebased to 0.
+    ``cuts`` maps episode_index -> cut spec, where each point is a frame
+    count ("120") or seconds with an "s" suffix ("3.5s", resolved via the
+    dataset fps):
+
+    - "START":       drop the first START frames (keep [START, end))
+    - "START:END":   keep frames [START, END)
+    - ":END":        drop everything from END onward (keep [0, END))
+
+    Cut points are relative to the dataset's *current* state (what you see
+    when playing it back). Videos are always cut too — lossless
+    keyframe-aligned stream copy when possible (the start may move up to
+    ``video_copy_slack`` frames earlier), AV1 re-encode otherwise (always for
+    B-frame streams) — and timestamps are rebased to 0.
 
     Unless ``force`` is set, a cut that would leave an episode shorter than
     2 seconds is refused. All validation happens before any file is touched.
@@ -350,19 +364,26 @@ def cut_dataset(
     info = json.loads(info_path.read_text())
     fps = float(info.get("fps") or 30)
 
-    resolved: dict[int, int] = {}
-    for ep, spec in cuts.items():
-        s = str(spec).strip().lower()
+    def to_frames(ep, point):
+        p = point.strip().lower()
         try:
-            frames = int(round(float(s[:-1]) * fps)) if s.endswith("s") else int(s)
+            return int(round(float(p[:-1]) * fps)) if p.endswith("s") else int(p)
         except ValueError:
             raise ValueError(
-                f"cut: bad spec {spec!r} for episode {ep} — use frames ('120') "
-                f"or seconds ('3.5s')"
+                f"cut: bad cut point {point!r} for episode {ep} — use frames "
+                f"('120') or seconds ('3.5s')"
             )
-        if frames <= 0:
-            raise ValueError(f"cut: episode {ep}: cut must be at least 1 frame (got {spec!r})")
-        resolved[int(ep)] = frames
+
+    resolved: dict[int, tuple[int, int | None]] = {}
+    for ep, spec in cuts.items():
+        start_s, sep, end_s = str(spec).strip().partition(":")
+        start = to_frames(ep, start_s) if start_s.strip() else 0
+        end = to_frames(ep, end_s) if sep and end_s.strip() else None
+        if start == 0 and end is None:
+            raise ValueError(f"cut: episode {ep}: spec {spec!r} cuts nothing")
+        if start < 0 or (end is not None and end <= 0):
+            raise ValueError(f"cut: episode {ep}: invalid cut range in {spec!r}")
+        resolved[int(ep)] = (start, end)
 
     # Validate every cut against episode lengths before touching any file.
     ep_jsonl = root / "meta" / "episodes.jsonl"
@@ -374,15 +395,16 @@ def cut_dataset(
             d = json.loads(line)
             lengths[d["episode_index"]] = d["length"]
     min_remaining = 1 if force else int(round(2 * fps))
-    for ep, frames in resolved.items():
+    for ep, (start, end) in resolved.items():
         if ep not in lengths:
             raise ValueError(f"cut: episode {ep} not found in dataset "
                              f"(has episodes {min(lengths)}..{max(lengths)})")
-        remaining = lengths[ep] - frames
+        eff_end = lengths[ep] if end is None else min(end, lengths[ep])
+        remaining = eff_end - start
         if remaining < min_remaining:
             raise ValueError(
-                f"cut: episode {ep} has {lengths[ep]} frames; cutting {frames} leaves "
-                f"{remaining} frames — less than "
+                f"cut: episode {ep} has {lengths[ep]} frames; keeping "
+                f"[{start}:{eff_end}) leaves {max(remaining, 0)} frames — less than "
                 + ("1 frame" if force else "2 seconds (use --force to override)")
             )
 
@@ -460,8 +482,13 @@ def _episode_video_paths(root: Path, info: dict, ep_idx: int) -> dict[str, Path]
     return out
 
 
-def _probe_video_packets(path: Path) -> tuple[int, list[int]]:
-    """Return (n_packets, keyframe indices in presentation order) without decoding."""
+def _probe_video_packets(path: Path) -> tuple[int, list[int], bool]:
+    """Return (n_packets, keyframe indices in presentation order, reordered).
+
+    ``reordered`` is True when packets are stored out of presentation order
+    (B-frames): stream-copy cuts are then unsafe (a cut at the end could drop
+    packets that later frames reference), so callers must re-encode instead.
+    """
     proc = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "packet=pts,flags", "-of", "csv=p=0", str(path)],
@@ -475,9 +502,11 @@ def _probe_video_packets(path: Path) -> tuple[int, list[int]]:
         if len(parts) < 2 or not parts[0].lstrip("-").isdigit():
             continue
         pkts.append((int(parts[0]), "K" in parts[1]))
+    pts_in_file_order = [p for p, _ in pkts]
+    reordered = any(b < a for a, b in zip(pts_in_file_order, pts_in_file_order[1:]))
     pkts.sort(key=lambda t: t[0])  # presentation order
     keyframes = [i for i, (_, k) in enumerate(pkts) if k]
-    return len(pkts), keyframes
+    return len(pkts), keyframes, reordered
 
 
 def _plan_video_trim(ep_videos: dict[str, Path], start: int, ep_len: int,
@@ -491,8 +520,10 @@ def _plan_video_trim(ep_videos: dict[str, Path], start: int, ep_len: int,
     """
     snapped = []
     gop = None
+    any_reordered = False
     for key, path in ep_videos.items():
-        n_pkts, keyframes = _probe_video_packets(path)
+        n_pkts, keyframes, reordered = _probe_video_packets(path)
+        any_reordered = any_reordered or reordered
         if n_pkts != ep_len:
             raise VideoTrimError(
                 f"episode {ep_idx}: video {path.name} ({key}) has {n_pkts} frames "
@@ -507,7 +538,9 @@ def _plan_video_trim(ep_videos: dict[str, Path], start: int, ep_len: int,
             gop = spacing if gop is None else min(gop, spacing)
     common_start = min(snapped)
     gop = gop or 2
-    if start - common_start <= copy_slack:
+    # B-frame streams store packets out of display order; stream-copy cuts can
+    # sever references, so only re-encoding is frame-safe there.
+    if not any_reordered and start - common_start <= copy_slack:
         return "copy", common_start, gop, None
     return "reencode", start, gop, None
 
@@ -555,7 +588,7 @@ def _cut_video_file(path: Path, start: int, n_frames: int, fps: float, mode: str
         raise VideoTrimError(f"ffmpeg cut failed on {path.name}: {proc.stderr.strip()}")
 
     # Verify before replacing the original.
-    n_out, _ = _probe_video_packets(tmp)
+    n_out, _, _ = _probe_video_packets(tmp)
     first_pts = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
          "-show_entries", "packet=pts", "-of", "csv=p=0", str(tmp)],
