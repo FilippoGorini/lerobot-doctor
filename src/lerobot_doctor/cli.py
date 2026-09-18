@@ -47,6 +47,23 @@ def main(argv: list[str] | None = None):
     trim_p.add_argument("--threshold", type=float, default=0.01)
     trim_p.add_argument("--min-active", type=int, default=10)
     trim_p.add_argument("--keep-static", action="store_true")
+    trim_p.add_argument("--gripper-preroll", type=float, default=0.5, metavar="SECONDS",
+                        help="Keep this many seconds before a gripper-leads-arm transition "
+                             "(0 disables). Default: 0.5")
+    trim_p.add_argument("--trim-videos", action="store_true",
+                        help="Also cut each episode's mp4 to the kept frames and rebase "
+                             "timestamps to 0. Lossless stream copy when the trim start can "
+                             "snap to a keyframe (LeRobot g=2: always, at most 1 extra frame); "
+                             "otherwise frame-exact libaom-av1 re-encode (AV1 kept).")
+    trim_p.add_argument("--video-copy-slack", type=int, default=4, metavar="FRAMES",
+                        help="Max extra leading frames to keep for keyframe alignment before "
+                             "falling back to re-encode. Default: 4")
+    trim_p.add_argument("--video-crf", type=int, default=14,
+                        help="libaom-av1 CRF for the re-encode fallback (lower = better). "
+                             "Default: 14")
+    trim_p.add_argument("--video-cpu-used", type=int, default=3,
+                        help="libaom-av1 speed preset for the re-encode fallback "
+                             "(0 slowest/best .. 8 fastest). Default: 3")
     trim_p.add_argument("--dry-run", action="store_true")
 
     # === SCORE ===
@@ -164,18 +181,30 @@ def _run_fix(args):
 
 def _run_trim(args):
     from pathlib import Path
-    from lerobot_doctor.trim import trim_dataset
+    from lerobot_doctor.trim import trim_dataset, VideoTrimError
 
-    result = trim_dataset(
-        Path(args.dataset), action_threshold=args.threshold,
-        min_active_frames=args.min_active, remove_fully_static=not args.keep_static,
-        dry_run=args.dry_run,
-    )
+    try:
+        result = trim_dataset(
+            Path(args.dataset), action_threshold=args.threshold,
+            min_active_frames=args.min_active, remove_fully_static=not args.keep_static,
+            gripper_preroll_s=args.gripper_preroll,
+            trim_videos=args.trim_videos, video_copy_slack=args.video_copy_slack,
+            video_crf=args.video_crf, video_cpu_used=args.video_cpu_used,
+            dry_run=args.dry_run,
+        )
+    except (NotImplementedError, VideoTrimError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     prefix = "[DRY RUN] " if args.dry_run else ""
     for d in result.details:
         print(f"  {prefix}{d}")
-    print(f"\n{prefix}{result.episodes_trimmed} trimmed, {result.frames_removed} frames removed, "
-          f"{result.episodes_removed} episodes dropped")
+    summary = (f"\n{prefix}{result.episodes_trimmed} trimmed, {result.frames_removed} frames "
+               f"removed, {result.episodes_removed} episodes dropped")
+    if args.trim_videos:
+        n_copy = result.videos_trimmed - result.videos_reencoded
+        summary += (f", {result.videos_trimmed} videos cut "
+                    f"({n_copy} lossless copy, {result.videos_reencoded} re-encoded)")
+    print(summary)
 
 
 def _run_score(args):
