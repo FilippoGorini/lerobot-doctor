@@ -66,6 +66,19 @@ def main(argv: list[str] | None = None):
                              "(0 slowest/best .. 8 fastest). Default: 3")
     trim_p.add_argument("--dry-run", action="store_true")
 
+    # === CUT ===
+    cut_p = subparsers.add_parser(
+        "cut", help="Cut the first N frames / M seconds from specific episodes (videos included)")
+    cut_p.add_argument("dataset", help="Path to local dataset (v2.x)")
+    cut_p.add_argument("--cut", action="append", default=[], metavar="EP:START", dest="cuts",
+                       help="Episode and cut point: '42:120' (frames) or '42:3.5s' (seconds). "
+                            "Repeatable. Cut points are relative to the current dataset state.")
+    cut_p.add_argument("--cuts-file", metavar="FILE",
+                       help="File with one EP:START spec per line ('#' comments allowed)")
+    cut_p.add_argument("--force", action="store_true",
+                       help="Allow cuts that leave an episode shorter than 2 seconds")
+    cut_p.add_argument("--dry-run", action="store_true")
+
     # === SCORE ===
     score_p = subparsers.add_parser("score", help="Score episodes on quality")
     score_p.add_argument("dataset", help="Path to dataset")
@@ -89,7 +102,7 @@ def main(argv: list[str] | None = None):
     if argv is None:
         argv = sys.argv[1:]
 
-    known_commands = {"check", "fix", "trim", "score", "gate", "merge-check", "--version", "-h", "--help"}
+    known_commands = {"check", "fix", "trim", "cut", "score", "gate", "merge-check", "--version", "-h", "--help"}
     if argv and argv[0] not in known_commands and not argv[0].startswith("-"):
         argv = ["check"] + argv
 
@@ -101,6 +114,8 @@ def main(argv: list[str] | None = None):
         _run_fix(args)
     elif args.command == "trim":
         _run_trim(args)
+    elif args.command == "cut":
+        _run_cut(args)
     elif args.command == "score":
         _run_score(args)
     elif args.command == "gate":
@@ -205,6 +220,50 @@ def _run_trim(args):
         summary += (f", {result.videos_trimmed} videos cut "
                     f"({n_copy} lossless copy, {result.videos_reencoded} re-encoded)")
     print(summary)
+
+
+def _run_cut(args):
+    from pathlib import Path
+    from lerobot_doctor.trim import cut_dataset, VideoTrimError
+
+    specs = list(args.cuts)
+    if args.cuts_file:
+        for line in Path(args.cuts_file).read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                specs.append(line)
+    if not specs:
+        print("Error: no cuts given (use --cut EP:START and/or --cuts-file)", file=sys.stderr)
+        sys.exit(1)
+
+    cuts = {}
+    for spec in specs:
+        ep_s, sep, start_s = spec.partition(":")
+        try:
+            ep = int(ep_s)
+        except ValueError:
+            ep = None
+        if ep is None or not sep or not start_s:
+            print(f"Error: bad cut spec {spec!r} (expected EP:START, e.g. '42:120' or '42:3.5s')",
+                  file=sys.stderr)
+            sys.exit(1)
+        if ep in cuts:
+            print(f"Error: episode {ep} given more than once", file=sys.stderr)
+            sys.exit(1)
+        cuts[ep] = start_s
+
+    try:
+        result = cut_dataset(Path(args.dataset), cuts, dry_run=args.dry_run, force=args.force)
+    except (NotImplementedError, ValueError, VideoTrimError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    prefix = "[DRY RUN] " if args.dry_run else ""
+    for d in result.details:
+        print(f"  {prefix}{d}")
+    n_copy = result.videos_trimmed - result.videos_reencoded
+    print(f"\n{prefix}{result.episodes_trimmed} episodes cut, {result.frames_removed} frames removed, "
+          f"{result.videos_trimmed} videos cut ({n_copy} lossless copy, {result.videos_reencoded} re-encoded)")
 
 
 def _run_score(args):

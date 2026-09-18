@@ -44,6 +44,8 @@ def trim_dataset(
     video_copy_slack: int = 4,
     video_crf: int = 14,
     video_cpu_used: int = 3,
+    manual_cuts: dict[int, int] | None = None,
+    min_remaining_frames: int = 1,
     dry_run: bool = False,
 ) -> TrimResult:
     """Trim idle frames from episodes.
@@ -70,6 +72,12 @@ def trim_dataset(
             visually transparent).
         video_cpu_used: libaom-av1 speed/quality knob for the fallback
             (0 = slowest/best, default 3).
+        manual_cuts: Manual mode (used by ``cut_dataset``): {episode_index:
+            n_leading_frames_to_drop}. Episodes not listed pass through
+            untouched; activity detection, static removal and gripper pre-roll
+            are all skipped.
+        min_remaining_frames: Manual mode only — refuse a cut that would leave
+            an episode shorter than this.
         dry_run: Only report, don't modify
     """
     result = TrimResult(episodes_trimmed=0, frames_removed=0, episodes_removed=0, details=[])
@@ -118,9 +126,9 @@ def trim_dataset(
             if "episode_index" not in table.column_names:
                 continue
 
-            # Find action columns
+            # Find action columns (not needed in manual-cut mode)
             action_cols = [c for c in table.column_names if c.startswith("action")]
-            if not action_cols:
+            if not action_cols and manual_cuts is None:
                 continue
 
             ep_col = table.column("episode_index").to_pylist()
@@ -136,82 +144,99 @@ def trim_dataset(
             for ep_idx in sorted(episodes.keys()):
                 row_indices = episodes[ep_idx]
 
-                # Get action values for this episode.
-                # Action columns may be stored either as multiple scalar
-                # columns (one feature each) or as a single vector-valued
-                # column where each row is a list/array of shape [D]
-                # (the standard LeRobot packed layout). Handle both.
-                action_parts = []
-                col_names = []  # name per column of action_matrix (for gripper detection)
-                for col in action_cols:
-                    try:
-                        vals = np.array([table.column(col)[i].as_py() for i in row_indices], dtype=np.float64)
-                    except (ValueError, TypeError):
+                if manual_cuts is not None:
+                    # Manual cut mode: only listed episodes are touched, and
+                    # the cut point is taken as-is (no activity detection, no
+                    # static removal, no gripper pre-roll).
+                    if ep_idx not in manual_cuts:
+                        rows_to_keep.extend(row_indices)
                         continue
-                    if vals.ndim == 1:
-                        # scalar-per-frame column -> one feature dimension
-                        action_parts.append(vals.reshape(-1, 1))
-                        col_names.append(col)
-                    elif vals.ndim == 2:
-                        # vector-per-frame column (e.g. one "action" list of shape [D])
-                        action_parts.append(vals)
-                        if col == "action" and action_dim_names and len(action_dim_names) == vals.shape[1]:
-                            col_names.extend(action_dim_names)
-                        else:
-                            col_names.extend(f"{col}[{k}]" for k in range(vals.shape[1]))
-                    # ignore higher-dim / ragged columns
+                    start, end = manual_cuts[ep_idx], len(row_indices)
+                    if end - start < max(min_remaining_frames, 1):
+                        raise ValueError(
+                            f"cut: episode {ep_idx} has {len(row_indices)} frames; "
+                            f"cutting {start} leaves {end - start} "
+                            f"(minimum {max(min_remaining_frames, 1)})"
+                        )
+                else:
+                    # Get action values for this episode.
+                    # Action columns may be stored either as multiple scalar
+                    # columns (one feature each) or as a single vector-valued
+                    # column where each row is a list/array of shape [D]
+                    # (the standard LeRobot packed layout). Handle both.
+                    action_parts = []
+                    col_names = []  # name per column of action_matrix (for gripper detection)
+                    for col in action_cols:
+                        try:
+                            vals = np.array([table.column(col)[i].as_py() for i in row_indices], dtype=np.float64)
+                        except (ValueError, TypeError):
+                            continue
+                        if vals.ndim == 1:
+                            # scalar-per-frame column -> one feature dimension
+                            action_parts.append(vals.reshape(-1, 1))
+                            col_names.append(col)
+                        elif vals.ndim == 2:
+                            # vector-per-frame column (e.g. one "action" list of shape [D])
+                            action_parts.append(vals)
+                            if col == "action" and action_dim_names and len(action_dim_names) == vals.shape[1]:
+                                col_names.extend(action_dim_names)
+                            else:
+                                col_names.extend(f"{col}[{k}]" for k in range(vals.shape[1]))
+                        # ignore higher-dim / ragged columns
 
-                if not action_parts:
-                    rows_to_keep.extend(row_indices)
-                    continue
-
-                action_matrix = np.hstack(action_parts) if len(action_parts) > 1 else action_parts[0]
-
-                # Compute per-frame "activity" as action change magnitude
-                if len(action_matrix) < 2:
-                    rows_to_keep.extend(row_indices)
-                    continue
-
-                diffs = np.abs(np.diff(action_matrix, axis=0))
-                activity = np.concatenate([[0], diffs.mean(axis=1)])
-                # Frame 0 has no predecessor, so its activity is undefined; let
-                # it inherit frame 1's. Otherwise the first frame always counts
-                # as idle and every re-run of trim shaves one more leading frame
-                # off already-trimmed episodes (systematic 1-frame creep).
-                activity[0] = activity[1]
-                is_active = activity > action_threshold
-
-                # Find first and last active frames
-                active_indices = np.where(is_active)[0]
-
-                if len(active_indices) < min_active_frames:
-                    if remove_fully_static:
-                        result.episodes_removed += 1
-                        result.frames_removed += len(row_indices)
-                        removed_eps.append(ep_idx)
-                        result.details.append(f"Episode {ep_idx}: removed (fully static)")
-                        continue
-                    else:
+                    if not action_parts:
                         rows_to_keep.extend(row_indices)
                         continue
 
-                start = active_indices[0] if trim_start else 0
-                end = active_indices[-1] + 1 if trim_end else len(row_indices)
+                    action_matrix = np.hstack(action_parts) if len(action_parts) > 1 else action_parts[0]
 
-                # Gripper pre-roll: if the gripper begins moving before the arm
-                # (e.g. closing the gripper to nudge an object), keep a short
-                # window of frames before that transition so the episode starts
-                # from the resting/open-gripper state and the open->close
-                # transition is captured, instead of starting mid-close.
-                if (trim_start and preroll_frames > 0
-                        and len(col_names) == action_matrix.shape[1]):
-                    gripper_mask = np.array([_is_gripper(n) for n in col_names], dtype=bool)
-                    if gripper_mask.any() and not gripper_mask.all():
-                        arm_activity = np.concatenate([[0.0], diffs[:, ~gripper_mask].mean(axis=1)])
-                        arm_active = np.where(arm_activity > action_threshold)[0]
-                        gripper_leads = (len(arm_active) == 0) or (start < arm_active[0])
-                        if gripper_leads:
-                            start = max(0, start - preroll_frames)
+                    # Compute per-frame "activity" as action change magnitude
+                    if len(action_matrix) < 2:
+                        rows_to_keep.extend(row_indices)
+                        continue
+
+                    diffs = np.abs(np.diff(action_matrix, axis=0))
+                    activity = np.concatenate([[0], diffs.mean(axis=1)])
+                    # Frame 0 has no predecessor, so its activity is undefined;
+                    # let it inherit frame 1's. Otherwise the first frame always
+                    # counts as idle and every re-run of trim shaves one more
+                    # leading frame off already-trimmed episodes (systematic
+                    # 1-frame creep).
+                    activity[0] = activity[1]
+                    is_active = activity > action_threshold
+
+                    # Find first and last active frames
+                    active_indices = np.where(is_active)[0]
+
+                    if len(active_indices) < min_active_frames:
+                        if remove_fully_static:
+                            result.episodes_removed += 1
+                            result.frames_removed += len(row_indices)
+                            removed_eps.append(ep_idx)
+                            result.details.append(f"Episode {ep_idx}: removed (fully static)")
+                            continue
+                        else:
+                            rows_to_keep.extend(row_indices)
+                            continue
+
+                    start = active_indices[0] if trim_start else 0
+                    end = active_indices[-1] + 1 if trim_end else len(row_indices)
+
+                    # Gripper pre-roll: if the gripper begins moving before the
+                    # arm (e.g. closing the gripper to nudge an object), keep a
+                    # short window of frames before that transition so the
+                    # episode starts from the resting/open-gripper state and the
+                    # open->close transition is captured, instead of starting
+                    # mid-close.
+                    if (trim_start and preroll_frames > 0
+                            and len(col_names) == action_matrix.shape[1]):
+                        gripper_mask = np.array([_is_gripper(n) for n in col_names], dtype=bool)
+                        if gripper_mask.any() and not gripper_mask.all():
+                            arm_activity = np.concatenate([[0.0], diffs[:, ~gripper_mask].mean(axis=1)])
+                            arm_active = np.where(arm_activity > action_threshold)[0]
+                            gripper_leads = (len(arm_active) == 0) or (start < arm_active[0])
+                            if gripper_leads:
+                                start = max(0, start - preroll_frames)
 
                 # Video trim planning: snap the trim start down to the nearest
                 # frame that is a keyframe in every camera so the mp4 can be cut
@@ -223,6 +248,11 @@ def trim_dataset(
                 video_note = ""
                 if trim_videos and (start > 0 or end < len(row_indices)):
                     ep_videos = _episode_video_paths(root, info, ep_idx)
+                    if manual_cuts is not None and len(ep_videos) < len(
+                            [k for k, v in info.get("features", {}).items() if v.get("dtype") == "video"]):
+                        raise VideoTrimError(
+                            f"cut: episode {ep_idx}: expected video files not found on disk"
+                        )
                     if ep_videos:
                         mode, start, gop, pix_fmt = _plan_video_trim(
                             ep_videos, start, len(row_indices), video_copy_slack, ep_idx
@@ -240,8 +270,10 @@ def trim_dataset(
                 if n_removed > 0:
                     result.episodes_trimmed += 1
                     result.frames_removed += n_removed
+                    verb = ("cut first" if manual_cuts is not None else "trimmed")
+                    kind = "" if manual_cuts is not None else " idle"
                     result.details.append(
-                        f"Episode {ep_idx}: trimmed {n_removed} idle frames "
+                        f"Episode {ep_idx}: {verb} {n_removed}{kind} frames "
                         f"({len(row_indices)} → {len(trimmed_indices)}){video_note}"
                     )
                 elif pending_cuts and pending_cuts[-1][0] == ep_idx:
@@ -288,6 +320,82 @@ def trim_dataset(
         _update_metadata_after_trim(root)
 
     return result
+
+
+def cut_dataset(
+    root: Path,
+    cuts: dict[int, str],
+    dry_run: bool = False,
+    force: bool = False,
+    video_copy_slack: int = 4,
+    video_crf: int = 14,
+    video_cpu_used: int = 3,
+) -> TrimResult:
+    """Manually cut the first frames/seconds off specific episodes.
+
+    ``cuts`` maps episode_index -> cut spec: a frame count ("120") or seconds
+    with an "s" suffix ("3.5s", resolved via the dataset fps). Cut points are
+    relative to the dataset's *current* state (what you see when playing it
+    back). Videos are always cut too — lossless keyframe-aligned stream copy
+    when possible (the start may move up to ``video_copy_slack`` frames
+    earlier), AV1 re-encode otherwise — and timestamps are rebased to 0.
+
+    Unless ``force`` is set, a cut that would leave an episode shorter than
+    2 seconds is refused. All validation happens before any file is touched.
+    """
+    root = Path(root)
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        raise ValueError("cut: meta/info.json not found — not a LeRobot dataset root")
+    info = json.loads(info_path.read_text())
+    fps = float(info.get("fps") or 30)
+
+    resolved: dict[int, int] = {}
+    for ep, spec in cuts.items():
+        s = str(spec).strip().lower()
+        try:
+            frames = int(round(float(s[:-1]) * fps)) if s.endswith("s") else int(s)
+        except ValueError:
+            raise ValueError(
+                f"cut: bad spec {spec!r} for episode {ep} — use frames ('120') "
+                f"or seconds ('3.5s')"
+            )
+        if frames <= 0:
+            raise ValueError(f"cut: episode {ep}: cut must be at least 1 frame (got {spec!r})")
+        resolved[int(ep)] = frames
+
+    # Validate every cut against episode lengths before touching any file.
+    ep_jsonl = root / "meta" / "episodes.jsonl"
+    if not ep_jsonl.exists():
+        raise ValueError("cut: meta/episodes.jsonl not found (a v2.x dataset is required)")
+    lengths = {}
+    for line in ep_jsonl.read_text().splitlines():
+        if line.strip():
+            d = json.loads(line)
+            lengths[d["episode_index"]] = d["length"]
+    min_remaining = 1 if force else int(round(2 * fps))
+    for ep, frames in resolved.items():
+        if ep not in lengths:
+            raise ValueError(f"cut: episode {ep} not found in dataset "
+                             f"(has episodes {min(lengths)}..{max(lengths)})")
+        remaining = lengths[ep] - frames
+        if remaining < min_remaining:
+            raise ValueError(
+                f"cut: episode {ep} has {lengths[ep]} frames; cutting {frames} leaves "
+                f"{remaining} frames — less than "
+                + ("1 frame" if force else "2 seconds (use --force to override)")
+            )
+
+    return trim_dataset(
+        root,
+        manual_cuts=resolved,
+        min_remaining_frames=min_remaining,
+        trim_videos=True,
+        video_copy_slack=video_copy_slack,
+        video_crf=video_crf,
+        video_cpu_used=video_cpu_used,
+        dry_run=dry_run,
+    )
 
 
 def _reindex_frames(table: pa.Table) -> pa.Table:
@@ -338,8 +446,15 @@ def _episode_video_paths(root: Path, info: dict, ep_idx: int) -> dict[str, Path]
     video_keys = [k for k, v in info.get("features", {}).items() if v.get("dtype") == "video"]
     out = {}
     for key in video_keys:
-        p = root / tmpl.format(episode_chunk=ep_idx // chunks_size,
-                               video_key=key, episode_index=ep_idx)
+        try:
+            p = root / tmpl.format(episode_chunk=ep_idx // chunks_size,
+                                   video_key=key, episode_index=ep_idx)
+        except (KeyError, IndexError):
+            raise VideoTrimError(
+                f"video_path template {tmpl!r} is not a v2.x per-episode layout "
+                f"(expected placeholders episode_chunk/video_key/episode_index) — "
+                f"the dataset metadata looks corrupted or v3.0"
+            )
         if p.exists():
             out[key] = p
     return out
